@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Antminer Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        margin: 16px;
+        background: #121212;
+        color: #e0e0e0;
+      }
+      .controls {
+        margin-bottom: 12px;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+      }
+      .chart-container {
+        width: 100%;
+        height: 280px;
+        margin-bottom: 20px;
+        background: #1e1e1e;
+        padding: 10px;
+        border-radius: 6px;
+      }
+      table {
+        border-collapse: collapse;
+        width: 100%;
+        margin-top: 20px;
+        background: #1e1e1e;
+        color: #e0e0e0;
+      }
+      th,
+      td {
+        border: 1px solid #333;
+        padding: 4px;
+        text-align: center;
+      }
+      th {
+        background: #2a2a2a;
+      }
+      .status-running {
+        background: #1b5e20;
+      }
+      .status-paused {
+        background: #b71c1c;
+      }
+    </style>
+  </head>
+  <body>
+    <h2>Antminer Dashboard</h2>
+
+    <!-- Ratio Controls -->
+    <div class="controls" id="ratioControls">
+      <label
+        >Numerator:
+        <select id="numerator"></select>
+      </label>
+      <label
+        >Denominator:
+        <select id="denominator"></select>
+      </label>
+      <button id="addRatioBtn">Add Ratio Chart</button>
+    </div>
+
+    <!-- Ratio Charts -->
+    <div id="ratioCharts"></div>
+
+    <!-- Individual chart toggles -->
+    <div class="controls" id="controls"></div>
+
+    <!-- Individual charts -->
+    <div id="charts"></div>
+
+    <!-- Log Table -->
+    <table id="logTable">
+      <thead>
+        <tr id="headerRow"></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+
+    <script>
+      let allColumns = [];
+      let records = [];
+      const charts = {}; // individual charts keyed by column
+      const ratioCharts = {}; // keyed by "numer/denom" -> { chart, numer, denom }
+
+      const numSel = document.getElementById("numerator");
+      const denSel = document.getElementById("denominator");
+      const addRatioBtn = document.getElementById("addRatioBtn");
+
+      // Define acceptable ranges per field
+      const ratioRules = {
+        Hash: { min: 1 }, // only calculate if Hash >= 1
+        Pwr: { min: 100, max: 5000 }, // only calculate if Pwr is between 100–5000
+      };
+      const fieldRanges = {
+        Hash: { min: 140, max: 350 }, // TH/s
+        Pwr: { min: 75, max: 4500 }, // Watts
+        Pincm: { min: -50, max: 1000 }, // Watts
+        // add more fields as needed
+      };
+
+      function clampValue(field, val) {
+        const rule = fieldRanges[field];
+        if (!rule) return val; // no rule defined
+        if (val < rule.min) return rule.min;
+        if (val > rule.max) return rule.max;
+        return val;
+      }
+      function createChart(ctx, label, color) {
+        return new Chart(ctx, {
+          type: "line",
+          data: {
+            labels: [],
+            datasets: [
+              {
+                label: label,
+                data: [],
+                borderColor: color,
+                borderWidth: 3,
+                backgroundColor: color + "66",
+                fill: true,
+                tension: 0.3,
+                pointRadius: 4,
+                pointBackgroundColor: color,
+                pointBorderColor: "#000",
+              },
+            ],
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+              x: {
+                ticks: { color: "#ddd", font: { size: 12 } },
+                grid: { color: "#444" },
+              },
+              y: {
+                ticks: { color: "#ddd", font: { size: 12 } },
+                grid: { color: "#444" },
+                beginAtZero: false,
+              },
+            },
+            plugins: {
+              legend: {
+                labels: { color: "#fff", font: { size: 13, weight: "bold" } },
+              },
+            },
+          },
+        });
+      }
+
+      function createRatioChart(ctx, label) {
+        return new Chart(ctx, {
+          type: "line",
+          data: {
+            labels: [],
+            datasets: [
+              {
+                label: label,
+                data: [],
+                borderColor: "#fff",
+                borderWidth: 2,
+                fill: false,
+                tension: 0.3,
+                pointRadius: 3,
+                pointBackgroundColor: "#fff",
+                pointBorderColor: "#000",
+              },
+            ],
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+              x: { ticks: { color: "#ddd" }, grid: { color: "#444" } },
+              y: {
+                ticks: { color: "#ddd" },
+                grid: { color: "#444" },
+                beginAtZero: false,
+              },
+            },
+            plugins: { legend: { labels: { color: "#fff" } } },
+          },
+        });
+      }
+
+      function addRow(data) {
+        const status = data["Status"] || "";
+        const cls =
+          status === "Running"
+            ? "status-running"
+            : status === "Paused"
+            ? "status-paused"
+            : "";
+        let row = "<tr class='" + cls + "'>";
+        allColumns.forEach((col) => {
+          row += "<td>" + (data[col] ?? "") + "</td>";
+        });
+        row += "</tr>";
+        document
+          .querySelector("#logTable tbody")
+          .insertAdjacentHTML("afterbegin", row);
+      }
+
+      function autoscaleY(chart, values) {
+        if (!values.length) return;
+        const min = Math.min(...values);
+        const max = Math.max(...values);
+        if (min === max) {
+          chart.options.scales.y.min = min * 0.9;
+          chart.options.scales.y.max = max * 1.1 + 0.1; // guard for flat line
+        } else {
+          chart.options.scales.y.min = min * 0.9;
+          chart.options.scales.y.max = max * 1.1;
+        }
+      }
+
+      function updateCharts(data) {
+        const ts = data.Time || new Date().toLocaleTimeString();
+        allColumns.forEach((col) => {
+          if (col === "Time" || col === "Status") return;
+
+          let val = parseFloat(data[col]);
+          if (!isNaN(val) && charts[col]) {
+            // 🔑 clamp only for individual charts
+            val = clampValue(col, val);
+
+            const chart = charts[col];
+            chart.data.labels.push(ts);
+            chart.data.datasets[0].data.push(val);
+
+            if (chart.data.labels.length > 300) {
+              chart.data.labels.shift();
+              chart.data.datasets[0].data.shift();
+            }
+
+            const values = chart.data.datasets[0].data.filter(
+              (v) => v !== undefined
+            );
+            autoscaleY(chart, values);
+            chart.update();
+          }
+        });
+      }
+
+      function toggleChart(col, show) {
+        const div = document.getElementById("chart-" + col);
+        if (div) div.style.display = show ? "block" : "none";
+      }
+
+      function saveSelection() {
+        const state = {};
+        document.querySelectorAll(".chart-toggle").forEach((cb) => {
+          state[cb.getAttribute("data-col")] = cb.checked;
+        });
+        localStorage.setItem("chartSelection", JSON.stringify(state));
+        localStorage.setItem(
+          "masterToggle",
+          document.getElementById("toggleAll").checked
+        );
+      }
+      function loadSelection() {
+        const state = JSON.parse(
+          localStorage.getItem("chartSelection") || "{}"
+        );
+        const master = localStorage.getItem("masterToggle");
+        return { state, master };
+      }
+
+      // Ratio handling
+      function addRatioChart(numer, denom) {
+        const key = numer + "/" + denom;
+        if (ratioCharts[key]) return; // already exists
+
+        // container + canvas
+        const div = document.createElement("div");
+        div.className = "chart-container";
+        div.id = "chart-" + key;
+        div.innerHTML =
+          "<canvas id='" + key.replace(/\W+/g, "_") + "Chart'></canvas>";
+        document.getElementById("ratioCharts").appendChild(div);
+
+        const canvasId = key.replace(/\W+/g, "_") + "Chart";
+        const ctx = document.getElementById(canvasId).getContext("2d");
+        const chart = createRatioChart(ctx, key);
+        ratioCharts[key] = { chart, numer, denom };
+
+        // preload existing records
+        records.forEach((r) => updateRatioData(r, numer, denom));
+      }
+
+      function updateRatioData(data, numer, denom) {
+        const key = numer + "/" + denom;
+        const rc = ratioCharts[key];
+        if (!rc) return;
+
+        const ts = data.Time || new Date().toLocaleTimeString();
+        const n = parseFloat(data[numer]);
+        const d = parseFloat(data[denom]);
+
+        let val = null; // default: skip
+
+        if (!isNaN(n) && !isNaN(d) && d !== 0) {
+          const nr = ratioRules[numer] || {};
+          const dr = ratioRules[denom] || {};
+
+          const nOk =
+            (nr.min === undefined || n >= nr.min) &&
+            (nr.max === undefined || n <= nr.max);
+          const dOk =
+            (dr.min === undefined || d >= dr.min) &&
+            (dr.max === undefined || d <= dr.max);
+
+          if (nOk && dOk) {
+            val = n / d;
+          }
+        }
+
+        rc.chart.data.labels.push(ts);
+        rc.chart.data.datasets[0].data.push(val);
+
+        if (rc.chart.data.labels.length > 300) {
+          rc.chart.data.labels.shift();
+          rc.chart.data.datasets[0].data.shift();
+        }
+
+        const values = rc.chart.data.datasets[0].data.filter(
+          (v) => v !== null && v !== undefined
+        );
+        autoscaleY(rc.chart, values);
+        rc.chart.update();
+      }
+      function addRatioChart(numer, denom) {
+        const key = numer + "/" + denom;
+        if (ratioCharts[key]) return; // already exists
+
+        // container + canvas + remove button
+        const div = document.createElement("div");
+        div.className = "chart-container";
+        div.id = "chart-" + key;
+
+        const safeId = key.replace(/\W+/g, "_");
+        div.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;">
+      <span style="font-weight:bold">${key}</span>
+      <button onclick="removeRatioChart('${key}')">Remove</button>
+    </div>
+    <canvas id="${safeId}Chart"></canvas>
+  `;
+        document.getElementById("ratioCharts").appendChild(div);
+
+        const ctx = document.getElementById(safeId + "Chart").getContext("2d");
+        const chart = createRatioChart(ctx, key);
+        ratioCharts[key] = { chart, numer, denom };
+
+        // 🔑 preload existing records so the chart isn't empty
+        records.forEach((r) => updateRatioData(r, numer, denom));
+
+        // 🔑 save state
+        saveRatioCharts();
+      }
+      function removeRatioChart(key) {
+        const rc = ratioCharts[key];
+        if (!rc) return;
+        rc.chart.destroy();
+        delete ratioCharts[key];
+        const div = document.getElementById("chart-" + key);
+        if (div) div.remove();
+
+        // 🔑 save state
+        saveRatioCharts();
+      }
+      function saveRatioCharts() {
+        const active = Object.keys(ratioCharts);
+        localStorage.setItem("activeRatioCharts", JSON.stringify(active));
+      }
+
+      // Wire "Add Ratio Chart" button
+      addRatioBtn.addEventListener("click", () => {
+        const numer = numSel.value;
+        const denom = denSel.value;
+        if (
+          !numer ||
+          !denom ||
+          numer === "Time" ||
+          numer === "Status" ||
+          denom === "Time" ||
+          denom === "Status"
+        )
+          return;
+        addRatioChart(numer, denom);
+      });
+
+      // Init from backend
+      fetch("/init")
+        .then((r) => r.json())
+        .then((payload) => {
+          records = payload.records || [];
+          allColumns = payload.fields || [];
+
+          // header
+          const header = document.getElementById("headerRow");
+          allColumns.forEach((c) => (header.innerHTML += "<th>" + c + "</th>"));
+
+          // populate ratio dropdowns (after allColumns is available)
+          allColumns.forEach((c) => {
+            if (c === "Time" || c === "Status") return;
+            numSel.add(new Option(c, c));
+            denSel.add(new Option(c, c));
+          });
+
+          // after records are loaded and dropdowns populated
+          const savedRatios = JSON.parse(
+            localStorage.getItem("activeRatioCharts") || "[]"
+          );
+          savedRatios.forEach((key) => {
+            const [numer, denom] = key.split("/");
+            if (allColumns.includes(numer) && allColumns.includes(denom)) {
+              addRatioChart(numer, denom);
+            }
+          });
+          // sensible defaults (if present)
+          if (allColumns.includes("Pwr")) numSel.value = "Pwr";
+          if (allColumns.includes("Hash")) denSel.value = "Hash";
+
+          // toggles
+          const controls = document.getElementById("controls");
+          controls.innerHTML =
+            '<label><input type="checkbox" id="toggleAll" checked> <b>Select/Deselect All</b></label>';
+
+          // build individual charts
+          const chartsDiv = document.getElementById("charts");
+          allColumns.forEach((col) => {
+            if (col === "Time" || col === "Status") return;
+
+            const div = document.createElement("div");
+            div.className = "chart-container";
+            div.id = "chart-" + col;
+            div.innerHTML = "<canvas id='" + col + "Chart'></canvas>";
+            chartsDiv.appendChild(div);
+
+            const ctx = document.getElementById(col + "Chart").getContext("2d");
+            const color =
+              "#" +
+              Math.floor(Math.random() * 17777215)
+                .toString(16)
+                .padStart(6, "0");
+            charts[col] = createChart(ctx, col, color);
+
+            controls.innerHTML +=
+              ' <label><input type="checkbox" class="chart-toggle" data-col="' +
+              col +
+              '" checked> ' +
+              col +
+              "</label>";
+          });
+
+          // restore saved state
+          const { state, master } = loadSelection();
+          if (master !== null) {
+            document.getElementById("toggleAll").checked = master === "true";
+          }
+          document.querySelectorAll(".chart-toggle").forEach((cb) => {
+            const col = cb.getAttribute("data-col");
+            if (state[col] !== undefined) {
+              cb.checked = state[col];
+              toggleChart(col, cb.checked);
+            }
+          });
+
+          // master toggle
+          document
+            .getElementById("toggleAll")
+            .addEventListener("change", function () {
+              const checked = this.checked;
+              document.querySelectorAll(".chart-toggle").forEach((cb) => {
+                cb.checked = checked;
+                toggleChart(cb.getAttribute("data-col"), checked);
+              });
+              saveSelection();
+            });
+
+          // individual toggles
+          document.querySelectorAll(".chart-toggle").forEach((cb) => {
+            cb.addEventListener("change", function () {
+              toggleChart(this.getAttribute("data-col"), this.checked);
+              const all = document.querySelectorAll(".chart-toggle");
+              const allChecked = Array.from(all).every((x) => x.checked);
+              document.getElementById("toggleAll").checked = allChecked;
+              saveSelection();
+            });
+          });
+
+          // preload records to table + individual charts
+          records.forEach((r) => {
+            addRow(r);
+            updateCharts(r);
+          });
+
+          // live stream
+          const evt = new EventSource("/stream");
+          evt.onmessage = (e) => {
+            const d = JSON.parse(e.data || "{}");
+            if (!Object.keys(d).length) return;
+            addRow(d);
+            updateCharts(d);
+            // update all active ratio charts
+            Object.values(ratioCharts).forEach((rc) => {
+              updateRatioData(d, rc.numer, rc.denom);
+            });
+          };
+        });
+    </script>
+  </body>
+</html>
