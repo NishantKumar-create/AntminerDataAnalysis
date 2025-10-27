@@ -1,5 +1,5 @@
 from flask import Flask, Response, render_template, jsonify
-import time, json, os, threading
+import time, json, os, threading, signal, sys
 import paramiko
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -8,12 +8,23 @@ app = Flask(__name__, template_folder=os.path.join(BASE_DIR, "templates"))
 # Remote miner log settings
 REMOTE_HOST = "10.0.0.76"
 REMOTE_USER = "root"
-REMOTE_PASS = "vmnr"   # ⚠️ Better: use SSH keys instead of storing password
+REMOTE_PASS = "vmnr"   # Consider SSH keys for production
 REMOTE_LOG  = "/var/log/bllcmon.log"
-LOCAL_LOG   = "data/bllcmon.log"
+LOCAL_LOG   = os.path.join(BASE_DIR, "data", "bllcmon.log")
+
+# Globals for cleanup
+ssh = None
+channel = None
+
+# Ensure local dir exists
+os.makedirs(os.path.dirname(LOCAL_LOG), exist_ok=True)
 
 def stream_remote_log():
-    """Continuously stream remote log into LOCAL_LOG with auto-reconnect."""
+    """
+    Single remote tail: send last 90 lines, then follow.
+    Writes to LOCAL_LOG. Auto-reconnect on errors.
+    """
+    global ssh, channel
     while True:
         try:
             ssh = paramiko.SSHClient()
@@ -21,19 +32,32 @@ def stream_remote_log():
             ssh.connect(REMOTE_HOST, username=REMOTE_USER, password=REMOTE_PASS, timeout=10)
 
             transport = ssh.get_transport()
+            transport.set_keepalive(30)
             channel = transport.open_session()
-            channel.exec_command(f"tail -90 -f {REMOTE_LOG}")
+            channel.get_pty()  # ensures remote tail dies when session closes
+            # ONE command: history + live
+            channel.exec_command(f"tail -n 90 -f {REMOTE_LOG}")
 
-            # append instead of overwrite, so history survives restarts
             with open(LOCAL_LOG, "a", buffering=1) as outfile:
                 while True:
                     if channel.recv_ready():
-                        data = channel.recv(1024).decode("utf-8", errors="ignore")
-                        outfile.write(data)
+                        data = channel.recv(4096).decode("utf-8", errors="ignore")
+                        if data:
+                            outfile.write(data)
+                    # If remote command ends, reconnect
                     if channel.exit_status_ready():
                         raise Exception("Remote channel closed")
+                    time.sleep(0.05)
         except Exception as e:
             print(f"[stream_remote_log] Error: {e}. Reconnecting in 5s...")
+            # Close any stale resources before reconnecting
+            try:
+                if channel:
+                    channel.close()
+                if ssh:
+                    ssh.close()
+            except:
+                pass
             time.sleep(5)
             continue
 
@@ -58,20 +82,26 @@ def read_last_n(n: int):
     return [parse_line(ln) for ln in tail if parse_line(ln)]
 
 def tail_log():
+    """
+    Server-Sent Events: start at end-of-file, stream only NEW lines.
+    Prevents duplication of the 90-line history returned by /init.
+    """
     if not os.path.exists(LOCAL_LOG):
+        # idle until local log appears
         while True:
             time.sleep(1)
             yield f"data: {json.dumps({})}\n\n"
     else:
         with open(LOCAL_LOG, "r") as f:
-            f.seek(0, 2)
+            f.seek(0, 2)  # jump to EOF, so we don't resend history
             while True:
                 line = f.readline()
                 if not line:
-                    time.sleep(0.5)
+                    time.sleep(0.25)
                     continue
                 parsed = parse_line(line)
-                yield f"data: {json.dumps(parsed)}\n\n"
+                if parsed:
+                    yield f"data: {json.dumps(parsed)}\n\n"
 
 @app.route("/stream")
 def stream():
@@ -79,7 +109,8 @@ def stream():
 
 @app.route("/init")
 def init_data():
-    records = read_last_n(30)
+    # Return a snapshot of last 90 rows
+    records = read_last_n(90)
     fields = list(records[0].keys()) if records else ["Time","Status","Hash","Pwr","ITmp","OTmp","EElec","Incm"]
     return jsonify({"records": records, "fields": fields})
 
@@ -87,8 +118,27 @@ def init_data():
 def index():
     return render_template("index.html")
 
+def cleanup(sig=None, frame=None):
+    """Cleanly terminate remote tail and SSH on exit."""
+    global ssh, channel
+    print("Cleaning up SSH session...")
+    try:
+        if channel:
+            channel.close()
+        if ssh:
+            ssh.close()
+    except:
+        pass
+    sys.exit(0)
+
 if __name__ == "__main__":
-    # Start background SSH log streamer
+    # Handle Ctrl-C / kill cleanly
+    signal.signal(signal.SIGINT, cleanup)
+    signal.signal(signal.SIGTERM, cleanup)
+
+    # Start single background SSH tail (history + live)
     t = threading.Thread(target=stream_remote_log, daemon=True)
     t.start()
-    app.run(host="0.0.0.0", port=8080, threaded=True, debug=True)
+
+    # IMPORTANT: Disable Flask reloader to avoid spawning multiple threads/processes
+    app.run(host="0.0.0.0", port=8080, threaded=True, debug=False, use_reloader=False)

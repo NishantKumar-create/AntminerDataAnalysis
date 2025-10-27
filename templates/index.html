@@ -56,12 +56,12 @@
     <div class="controls" id="ratioControls">
       <label
         >Numerator:
-        <select id="numerator"></select>
-      </label>
+        <select id="numerator"></select
+      ></label>
       <label
         >Denominator:
-        <select id="denominator"></select>
-      </label>
+        <select id="denominator"></select
+      ></label>
       <button id="addRatioBtn">Add Ratio Chart</button>
     </div>
 
@@ -92,6 +92,15 @@
       const denSel = document.getElementById("denominator");
       const addRatioBtn = document.getElementById("addRatioBtn");
 
+      // Frontend de-dupe and single stream guards (minimal fixes)
+      let seenRows = new Set();
+      function rowKey(d) {
+        return d && d.Time
+          ? d.Time + "|" + JSON.stringify(d)
+          : JSON.stringify(d);
+      }
+      let evt = null; // single EventSource instance
+
       // Define acceptable ranges per field
       const ratioRules = {
         Hash: { min: 1 }, // only calculate if Hash >= 1
@@ -111,6 +120,7 @@
         if (val > rule.max) return rule.max;
         return val;
       }
+
       function createChart(ctx, label, color) {
         return new Chart(ctx, {
           type: "line",
@@ -227,7 +237,7 @@
 
           let val = parseFloat(data[col]);
           if (!isNaN(val) && charts[col]) {
-            // 🔑 clamp only for individual charts
+            // clamp only for individual charts
             val = clampValue(col, val);
 
             const chart = charts[col];
@@ -264,6 +274,7 @@
           document.getElementById("toggleAll").checked
         );
       }
+
       function loadSelection() {
         const state = JSON.parse(
           localStorage.getItem("chartSelection") || "{}"
@@ -277,21 +288,47 @@
         const key = numer + "/" + denom;
         if (ratioCharts[key]) return; // already exists
 
-        // container + canvas
+        // container + canvas + remove button
         const div = document.createElement("div");
         div.className = "chart-container";
         div.id = "chart-" + key;
-        div.innerHTML =
-          "<canvas id='" + key.replace(/\W+/g, "_") + "Chart'></canvas>";
+
+        const safeId = key.replace(/\W+/g, "_");
+        div.innerHTML = `
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <span style="font-weight:bold">${key}</span>
+            <button onclick="removeRatioChart('${key}')">Remove</button>
+          </div>
+          <canvas id="${safeId}Chart"></canvas>
+        `;
         document.getElementById("ratioCharts").appendChild(div);
 
-        const canvasId = key.replace(/\W+/g, "_") + "Chart";
-        const ctx = document.getElementById(canvasId).getContext("2d");
+        const ctx = document.getElementById(safeId + "Chart").getContext("2d");
         const chart = createRatioChart(ctx, key);
         ratioCharts[key] = { chart, numer, denom };
 
-        // preload existing records
+        // preload existing records so the chart isn't empty
         records.forEach((r) => updateRatioData(r, numer, denom));
+
+        // save state
+        saveRatioCharts();
+      }
+
+      function removeRatioChart(key) {
+        const rc = ratioCharts[key];
+        if (!rc) return;
+        rc.chart.destroy();
+        delete ratioCharts[key];
+        const div = document.getElementById("chart-" + key);
+        if (div) div.remove();
+
+        // save state
+        saveRatioCharts();
+      }
+
+      function saveRatioCharts() {
+        const active = Object.keys(ratioCharts);
+        localStorage.setItem("activeRatioCharts", JSON.stringify(active));
       }
 
       function updateRatioData(data, numer, denom) {
@@ -303,23 +340,23 @@
         const n = parseFloat(data[numer]);
         const d = parseFloat(data[denom]);
 
-        let val = null; // default: skip
-
+        let val = null;
         if (!isNaN(n) && !isNaN(d) && d !== 0) {
           const nr = ratioRules[numer] || {};
           const dr = ratioRules[denom] || {};
-
           const nOk =
             (nr.min === undefined || n >= nr.min) &&
             (nr.max === undefined || n <= nr.max);
           const dOk =
             (dr.min === undefined || d >= dr.min) &&
             (dr.max === undefined || d <= dr.max);
-
-          if (nOk && dOk) {
-            val = n / d;
-          }
+          if (nOk && dOk) val = n / d;
         }
+
+        // NEW: prevent duplicate timestamps
+        if (!rc.seen) rc.seen = new Set();
+        if (rc.seen.has(ts)) return;
+        rc.seen.add(ts);
 
         rc.chart.data.labels.push(ts);
         rc.chart.data.datasets[0].data.push(val);
@@ -335,51 +372,6 @@
         autoscaleY(rc.chart, values);
         rc.chart.update();
       }
-      function addRatioChart(numer, denom) {
-        const key = numer + "/" + denom;
-        if (ratioCharts[key]) return; // already exists
-
-        // container + canvas + remove button
-        const div = document.createElement("div");
-        div.className = "chart-container";
-        div.id = "chart-" + key;
-
-        const safeId = key.replace(/\W+/g, "_");
-        div.innerHTML = `
-    <div style="display:flex;justify-content:space-between;align-items:center;">
-      <span style="font-weight:bold">${key}</span>
-      <button onclick="removeRatioChart('${key}')">Remove</button>
-    </div>
-    <canvas id="${safeId}Chart"></canvas>
-  `;
-        document.getElementById("ratioCharts").appendChild(div);
-
-        const ctx = document.getElementById(safeId + "Chart").getContext("2d");
-        const chart = createRatioChart(ctx, key);
-        ratioCharts[key] = { chart, numer, denom };
-
-        // 🔑 preload existing records so the chart isn't empty
-        records.forEach((r) => updateRatioData(r, numer, denom));
-
-        // 🔑 save state
-        saveRatioCharts();
-      }
-      function removeRatioChart(key) {
-        const rc = ratioCharts[key];
-        if (!rc) return;
-        rc.chart.destroy();
-        delete ratioCharts[key];
-        const div = document.getElementById("chart-" + key);
-        if (div) div.remove();
-
-        // 🔑 save state
-        saveRatioCharts();
-      }
-      function saveRatioCharts() {
-        const active = Object.keys(ratioCharts);
-        localStorage.setItem("activeRatioCharts", JSON.stringify(active));
-      }
-
       // Wire "Add Ratio Chart" button
       addRatioBtn.addEventListener("click", () => {
         const numer = numSel.value;
@@ -391,23 +383,32 @@
           numer === "Status" ||
           denom === "Time" ||
           denom === "Status"
-        )
+        ) {
           return;
+        }
         addRatioChart(numer, denom);
       });
 
-      // Init from backend
+      // Init from backend (minimal changes: clear state, de-dupe, single EventSource)
       fetch("/init")
         .then((r) => r.json())
         .then((payload) => {
+          // reset state so refresh doesn't stack rows
+          document.querySelector("#logTable tbody").innerHTML = "";
+          records = [];
+          seenRows.clear();
+
           records = payload.records || [];
           allColumns = payload.fields || [];
 
           // header
           const header = document.getElementById("headerRow");
+          header.innerHTML = "";
           allColumns.forEach((c) => (header.innerHTML += "<th>" + c + "</th>"));
 
           // populate ratio dropdowns (after allColumns is available)
+          numSel.innerHTML = "";
+          denSel.innerHTML = "";
           allColumns.forEach((c) => {
             if (c === "Time" || c === "Status") return;
             numSel.add(new Option(c, c));
@@ -435,6 +436,7 @@
 
           // build individual charts
           const chartsDiv = document.getElementById("charts");
+          chartsDiv.innerHTML = "";
           allColumns.forEach((col) => {
             if (col === "Time" || col === "Status") return;
 
@@ -496,23 +498,47 @@
             });
           });
 
-          // preload records to table + individual charts
+          // preload records to table + individual charts (de-dupe)
           records.forEach((r) => {
+            const key = rowKey(r);
+            if (seenRows.has(key)) return;
+            seenRows.add(key);
             addRow(r);
             updateCharts(r);
+            // update all active ratio charts
+            Object.values(ratioCharts).forEach((rc) => {
+              updateRatioData(r, rc.numer, rc.denom);
+            });
           });
 
-          // live stream
-          const evt = new EventSource("/stream");
+          // live stream (single EventSource, de-dupe)
+          if (evt) {
+            try {
+              evt.close();
+            } catch (_) {}
+          }
+          evt = new EventSource("/stream");
           evt.onmessage = (e) => {
             const d = JSON.parse(e.data || "{}");
             if (!Object.keys(d).length) return;
+            const key = rowKey(d);
+            if (seenRows.has(key)) return;
+            seenRows.add(key);
             addRow(d);
             updateCharts(d);
             // update all active ratio charts
             Object.values(ratioCharts).forEach((rc) => {
               updateRatioData(d, rc.numer, rc.denom);
             });
+          };
+          evt.onerror = (_) => {
+            try {
+              evt.close();
+            } catch (_) {}
+            // optional: auto-reconnect after brief delay
+            setTimeout(() => {
+              evt = new EventSource("/stream");
+            }, 1500);
           };
         });
     </script>
