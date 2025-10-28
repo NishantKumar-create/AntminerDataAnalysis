@@ -87,6 +87,7 @@
       let records = [];
       const charts = {}; // individual charts keyed by column
       const ratioCharts = {}; // keyed by "numer/denom" -> { chart, numer, denom }
+      const statusArray = []; // parallel array of miner statuses for shading
 
       const numSel = document.getElementById("numerator");
       const denSel = document.getElementById("denominator");
@@ -113,6 +114,40 @@
         // add more fields as needed
       };
 
+      // Plugin: shade chart background based on miner status
+      const statusShadingPlugin = {
+        id: "statusShading",
+        beforeDraw(chart, args, opts) {
+          if (!opts || !opts.statusArray) return;
+          const ctx = chart.ctx;
+          const xAxis = chart.scales.x;
+          const yAxis = chart.scales.y;
+          if (!xAxis || !yAxis) return;
+
+          chart.data.labels.forEach((_, i) => {
+            const status = opts.statusArray[i];
+            if (!status) return;
+            const xStart = xAxis.getPixelForValue(i - 0.5);
+            const xEnd = xAxis.getPixelForValue(i + 0.5);
+            ctx.save();
+            ctx.fillStyle =
+              status === "Running"
+                ? "rgba(27,94,32,0.15)"
+                : "rgba(183,28,28,0.15)";
+            ctx.fillRect(
+              xStart,
+              yAxis.top,
+              xEnd - xStart,
+              yAxis.bottom - yAxis.top
+            );
+            ctx.restore();
+          });
+        },
+      };
+      Chart.register(statusShadingPlugin);
+
+      let lastStatus = null;
+
       function clampValue(field, val) {
         const rule = fieldRanges[field];
         if (!rule) return val; // no rule defined
@@ -132,8 +167,8 @@
                 data: [],
                 borderColor: color,
                 borderWidth: 3,
-                backgroundColor: color + "66",
-                fill: true,
+                backgroundColor: "transparent",
+                fill: false,
                 tension: 0.3,
                 pointRadius: 4,
                 pointBackgroundColor: color,
@@ -156,9 +191,8 @@
               },
             },
             plugins: {
-              legend: {
-                labels: { color: "#fff", font: { size: 13, weight: "bold" } },
-              },
+              legend: { labels: { color: "#fff" } },
+              statusShading: { statusArray }, // ✅ inside plugins
             },
           },
         });
@@ -175,6 +209,7 @@
                 data: [],
                 borderColor: "#fff",
                 borderWidth: 2,
+                backgroundColor: "transparent", // no fill under the line
                 fill: false,
                 tension: 0.3,
                 pointRadius: 3,
@@ -194,7 +229,10 @@
                 beginAtZero: false,
               },
             },
-            plugins: { legend: { labels: { color: "#fff" } } },
+            plugins: {
+              legend: { labels: { color: "#fff" } },
+              statusShading: { statusArray }, // must be inside plugins
+            },
           },
         });
       }
@@ -209,7 +247,12 @@
             : "";
         let row = "<tr class='" + cls + "'>";
         allColumns.forEach((col) => {
-          row += "<td>" + (data[col] ?? "") + "</td>";
+          let val = data[col] ?? "";
+          if (col === "Time") {
+            val = formatTimestamp(val);
+          }
+
+          row += "<td>" + val + "</td>";
         });
         row += "</tr>";
         document
@@ -231,16 +274,19 @@
       }
 
       function updateCharts(data) {
-        const ts = data.Time || new Date().toLocaleTimeString();
+        const ts = data.Time
+          ? formatTimestamp(data.Time)
+          : new Date().toLocaleTimeString();
+
         allColumns.forEach((col) => {
           if (col === "Time" || col === "Status") return;
 
-          let val = parseFloat(data[col]);
-          if (!isNaN(val) && charts[col]) {
-            // clamp only for individual charts
-            val = clampValue(col, val);
-
+          const raw = (data[col] ?? "").toString();
+          const num = parseFloat(raw.replace(/[^0-9.\-]/g, ""));
+          if (!isNaN(num) && charts[col]) {
             const chart = charts[col];
+            const val = clampValue(col, num);
+
             chart.data.labels.push(ts);
             chart.data.datasets[0].data.push(val);
 
@@ -250,7 +296,7 @@
             }
 
             const values = chart.data.datasets[0].data.filter(
-              (v) => v !== undefined
+              (v) => v !== undefined && v !== null
             );
             autoscaleY(chart, values);
             chart.update();
@@ -330,13 +376,25 @@
         const active = Object.keys(ratioCharts);
         localStorage.setItem("activeRatioCharts", JSON.stringify(active));
       }
+      function formatTimestamp(ts) {
+        // Expecting something like "2025-10-27T18:02:03-0500"
+        if (!ts) return ts;
+        // Strip timezone if present
+        const main = ts.split(/[+-]\d{4}$/)[0]; // "2025-10-27T18:02:03"
+        const [date, time] = main.split("T");
+        if (!date || !time) return ts;
+        const compactDate = date.replace(/-/g, ""); // "20251027"
+        return compactDate + "-" + time;
+      }
 
       function updateRatioData(data, numer, denom) {
         const key = numer + "/" + denom;
         const rc = ratioCharts[key];
         if (!rc) return;
 
-        const ts = data.Time || new Date().toLocaleTimeString();
+        const ts = data.Time
+          ? formatTimestamp(data.Time)
+          : new Date().toLocaleTimeString();
         const n = parseFloat(data[numer]);
         const d = parseFloat(data[denom]);
 
@@ -498,13 +556,17 @@
             });
           });
 
-          // preload records to table + individual charts (de-dupe)
           records.forEach((r) => {
             const key = rowKey(r);
             if (seenRows.has(key)) return;
             seenRows.add(key);
+
             addRow(r);
             updateCharts(r);
+
+            statusArray.push(r.Status);
+            if (statusArray.length > 300) statusArray.shift();
+
             // update all active ratio charts
             Object.values(ratioCharts).forEach((rc) => {
               updateRatioData(r, rc.numer, rc.denom);
@@ -526,10 +588,19 @@
             seenRows.add(key);
             addRow(d);
             updateCharts(d);
+
+            // NEW: track status + update merged chart
+            statusArray.push(d.Status);
+            if (statusArray.length > 300) statusArray.shift();
+
             // update all active ratio charts
             Object.values(ratioCharts).forEach((rc) => {
               updateRatioData(d, rc.numer, rc.denom);
             });
+
+            // force redraw
+            Object.values(charts).forEach((c) => c.update());
+            Object.values(ratioCharts).forEach((rc) => rc.chart.update());
           };
           evt.onerror = (_) => {
             try {
