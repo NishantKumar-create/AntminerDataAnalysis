@@ -119,7 +119,7 @@
     </div>
 
     <!-- Ratio Charts -->
-    <div id="ratioCharts" class="chart-container"></div>
+    <div id="ratioCharts"></div>
 
     <!-- Merged chart -->
     <div class="chart-container">
@@ -229,9 +229,11 @@
         if (!ts) return ts;
         const main = ts.split(/[+-]\d{4}$/)[0];
         const [date, time] = main.split("T");
+
         if (!date || !time) return ts;
         const compactDate = date.replace(/-/g, "");
-        return compactDate + "-" + time;
+        const timePart = time.slice(0, 5); // "HH:mm"
+        return compactDate + "-" + timePart;
       }
 
       // Chart creators
@@ -646,6 +648,14 @@
             `;
         document.getElementById("ratioCharts").appendChild(div);
 
+        // 🔧 Auto-scale the chart container and canvas
+        div.style.width = "100%";
+        div.style.height = "min(40vh, 400px)"; // scales with screen but stays bounded
+        const canvas = div.querySelector("canvas");
+        canvas.style.width = "100%";
+        canvas.style.height = "100%";
+        canvas.style.display = "block"; // avoids inline shrink
+
         const ctx = document.getElementById(safeId + "Chart").getContext("2d");
         const chart = createRatioChart(ctx, key);
         ratioCharts[key] = { chart, numer, denom, seen: new Set() };
@@ -911,7 +921,7 @@
             // ✅ Now render the table with the latest slice
             renderTable(fullHistory.slice(-MAX_POINTS));
           };
-          
+
           evt.onerror = (_) => {
             try {
               evt.close();
