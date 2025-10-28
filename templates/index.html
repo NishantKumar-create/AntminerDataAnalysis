@@ -87,10 +87,40 @@
           transform: rotate(360deg);
         }
       }
+      .header-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 16px;
+        flex-wrap: nowrap; /* 👈 prevents wrapping */
+        gap: 20px;
+        white-space: nowrap; /* 👈 keeps summary text on one line */
+      }
+
+      .header-row h2 {
+        margin: 0;
+        font-size: 1.5rem;
+      }
+
+      #summaryStats {
+        font-size: 1rem;
+        font-weight: bold;
+        color: #fff;
+        background: #1e1e1e;
+        padding: 6px 12px;
+        border-radius: 6px;
+      }
     </style>
   </head>
   <body>
-    <h2>Antminer Dashboard</h2>
+    <div class="header-row">
+      <h2>Antminer Dashboard</h2>
+      <div id="summaryStats">
+        Total Earned: <span id="earnedAmount">$0</span> &nbsp; | &nbsp; Total
+        Spent: <span id="spentAmount">$0</span>
+      </div>
+    </div>
+
     <div class="controls-wrapper">
       <div class="controls" id="rowControl">
         <label for="maxPointsInput">Max points per chart:</label>
@@ -223,6 +253,29 @@
         if (val < rule.min) return rule.min;
         if (val > rule.max) return rule.max;
         return val;
+      }
+
+      function updateSummaryStats(dataRows) {
+        let totalEarned = 0;
+        let totalSpent = 0;
+
+        dataRows.forEach((row) => {
+          const incmRaw = (row.Incm ?? "").toString();
+          const expnRaw = (row.Expn ?? "").toString();
+
+          const incm = parseFloat(incmRaw.replace(/[^\d.\-]/g, ""));
+          const expn = parseFloat(expnRaw.replace(/[^\d.\-]/g, ""));
+
+          if (!isNaN(incm)) totalEarned += incm;
+          if (!isNaN(expn)) totalSpent += expn;
+        });
+
+        document.getElementById(
+          "earnedAmount"
+        ).textContent = `$${totalEarned.toFixed(5)}`;
+        document.getElementById(
+          "spentAmount"
+        ).textContent = `$${totalSpent.toFixed(5)}`;
       }
 
       function formatTimestamp(ts) {
@@ -875,7 +928,9 @@
             Object.values(ratioCharts).forEach((rc) => {
               updateRatioData(r, rc.numer, rc.denom);
             });
-            renderTable(fullHistory.slice(-MAX_POINTS));
+            const subset = fullHistory.slice(-MAX_POINTS);
+            renderTable(subset);
+            updateSummaryStats(subset);
           });
 
           document
@@ -919,7 +974,9 @@
             Object.values(ratioCharts).forEach((rc) => rc.chart.update());
 
             // ✅ Now render the table with the latest slice
-            renderTable(fullHistory.slice(-MAX_POINTS));
+            const subset = fullHistory.slice(-MAX_POINTS);
+            renderTable(subset);
+            updateSummaryStats(subset);
           };
 
           evt.onerror = (_) => {
@@ -973,6 +1030,7 @@
 
         const subset = fullHistory.slice(-MAX_POINTS);
         renderTable(subset);
+        updateSummaryStats(subset);
 
         // helper: wait for next frame or small delay
         const wait = (ms = 0) =>
