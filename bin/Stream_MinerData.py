@@ -15,13 +15,14 @@ LOCAL_LOG   = os.path.join(BASE_DIR, "data", "bllcmon.log")
 # Globals for cleanup
 ssh = None
 channel = None
+number_of_data_points = 200 #720
 
 # Ensure local dir exists
 os.makedirs(os.path.dirname(LOCAL_LOG), exist_ok=True)
 
 def stream_remote_log():
     """
-    Single remote tail: send last 90 lines, then follow.
+    Single remote tail: send last $number_of_data_points lines, then follow.
     Writes to LOCAL_LOG. Auto-reconnect on errors.
     """
     global ssh, channel
@@ -36,7 +37,7 @@ def stream_remote_log():
             channel = transport.open_session()
             channel.get_pty()  # ensures remote tail dies when session closes
             # ONE command: history + live
-            channel.exec_command(f"tail -n 90 -f {REMOTE_LOG}")
+            channel.exec_command(f"tail -n {number_of_data_points} -f {REMOTE_LOG}")
 
             with open(LOCAL_LOG, "a", buffering=1) as outfile:
                 while True:
@@ -109,8 +110,8 @@ def stream():
 
 @app.route("/init")
 def init_data():
-    # Return a snapshot of last 90 rows
-    records = read_last_n(90)
+    # Return a snapshot of last number_of_data_points rows
+    records = read_last_n(number_of_data_points)
     fields = list(records[0].keys()) if records else ["Time","Status","Hash","Pwr","ITmp","OTmp","EElec","Incm"]
     return jsonify({"records": records, "fields": fields})
 
