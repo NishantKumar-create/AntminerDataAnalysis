@@ -15,7 +15,7 @@ LOCAL_LOG   = os.path.join(BASE_DIR, "data", "bllcmon.log")
 # Globals for cleanup
 ssh = None
 channel = None
-number_of_data_points = 200 #720
+number_of_data_points = 720
 
 # Ensure local dir exists
 os.makedirs(os.path.dirname(LOCAL_LOG), exist_ok=True)

@@ -398,7 +398,6 @@
                 position: "left",
                 offset: true,
                 min: 0, // start at zero
-                // max: 0.1,     // optional fixed cap if you want
                 ticks: { color: "#ffeb3b" },
                 grid: { drawOnChartArea: false },
               },
@@ -496,24 +495,30 @@
       }
 
       // Table
-      function addRow(data) {
-        const status = data["Status"] || "";
-        const cls =
-          status === "Running"
-            ? "status-running"
-            : status === "Paused"
-            ? "status-paused"
-            : "";
-        let row = "<tr class='" + cls + "'>";
-        allColumns.forEach((col) => {
-          let val = data[col] ?? "";
-          if (col === "Time") val = formatTimestamp(val);
-          row += "<td>" + val + "</td>";
-        });
-        row += "</tr>";
-        document
-          .querySelector("#logTable tbody")
-          .insertAdjacentHTML("afterbegin", row);
+      function renderTable(subset) {
+        const tbody = document.querySelector("#logTable tbody");
+        tbody.innerHTML = ""; // Clear all rows
+
+        const reversed = subset.slice().reverse(); // Newest at top
+
+        for (const data of reversed) {
+          const status = data["Status"] || "";
+          const cls =
+            status === "Running"
+              ? "status-running"
+              : status === "Paused"
+              ? "status-paused"
+              : "";
+
+          let row = "<tr class='" + cls + "'>";
+          for (const col of allColumns) {
+            let val = data[col] ?? "";
+            if (col === "Time") val = formatTimestamp(val);
+            row += "<td>" + val + "</td>";
+          }
+          row += "</tr>";
+          tbody.insertAdjacentHTML("beforeend", row);
+        }
       }
 
       // Autoscale
@@ -847,7 +852,7 @@
             if (seenRows.has(key)) return;
             seenRows.add(key);
 
-            addRow(r);
+            //addRow(r);
             updateCharts(r);
             fullHistory.push(r);
 
@@ -860,6 +865,7 @@
             Object.values(ratioCharts).forEach((rc) => {
               updateRatioData(r, rc.numer, rc.denom);
             });
+            renderTable(fullHistory.slice(-MAX_POINTS));
           });
 
           document
@@ -889,12 +895,8 @@
             if (seenRows.has(key)) return;
             seenRows.add(key);
 
-            addRow(d);
             updateCharts(d);
-            fullHistory.push(d);
-
-            // statusArray.push(d.Status);
-            // if (statusArray.length > MAX_POINTS) statusArray.shift();
+            fullHistory.push(d); // Push first
 
             updateMergedChart(d);
             updateTempChart(d);
@@ -905,7 +907,11 @@
 
             Object.values(charts).forEach((c) => c.update());
             Object.values(ratioCharts).forEach((rc) => rc.chart.update());
+
+            // ✅ Now render the table with the latest slice
+            renderTable(fullHistory.slice(-MAX_POINTS));
           };
+          
           evt.onerror = (_) => {
             try {
               evt.close();
@@ -956,6 +962,7 @@
         }
 
         const subset = fullHistory.slice(-MAX_POINTS);
+        renderTable(subset);
 
         // helper: wait for next frame or small delay
         const wait = (ms = 0) =>
