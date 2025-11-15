@@ -1,70 +1,36 @@
-from flask import Flask, Response, render_template, jsonify
-import time, json, os, threading, signal, sys
-import paramiko
+from flask import Flask, Response, render_template, jsonify, request
+import time, json, os, signal, sys, requests
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 app = Flask(__name__, template_folder=os.path.join(BASE_DIR, "templates"))
 
-# Remote miner log settings
-REMOTE_HOST = "10.0.0.76"
-REMOTE_USER = "root"
-REMOTE_PASS = "vmnr"   # Consider SSH keys for production
-REMOTE_LOG  = "/var/log/bllcmon.log"
+# Google Drive log settings
+DRIVE_FILE_ID = "1BGwJx8DDQiz0H9ddujdRmpg0FRYaXnwB"
+DRIVE_URL = f"https://drive.google.com/uc?export=download&id={DRIVE_FILE_ID}"
 LOCAL_LOG   = os.path.join(BASE_DIR, "data", "bllcmon.log")
-
-# Globals for cleanup
-ssh = None
-channel = None
 
 # Web server settings
 host = "0.0.0.0"
 port = 8080
-number_of_data_points = 180  # Number of data points to fetch on init 720 for 1 day
+number_of_data_points = 180  # snapshot size
 
-# Ensure local dir exists
+# Track last line index globally
+last_line_index = 0
+
 os.makedirs(os.path.dirname(LOCAL_LOG), exist_ok=True)
 
-def stream_remote_log():
-    """
-    Single remote tail: send last $number_of_data_points lines, then follow.
-    Writes to LOCAL_LOG. Auto-reconnect on errors.
-    """
-    global ssh, channel
-    while True:
-        try:
-            ssh = paramiko.SSHClient()
-            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            ssh.connect(REMOTE_HOST, username=REMOTE_USER, password=REMOTE_PASS, timeout=10)
-
-            transport = ssh.get_transport()
-            transport.set_keepalive(30)
-            channel = transport.open_session()
-            channel.get_pty()  # ensures remote tail dies when session closes
-            # ONE command: history + live
-            channel.exec_command(f"tail -n {number_of_data_points} -f {REMOTE_LOG}")
-
-            with open(LOCAL_LOG, "a", buffering=1) as outfile:
-                while True:
-                    if channel.recv_ready():
-                        data = channel.recv(4096).decode("utf-8", errors="ignore")
-                        if data:
-                            outfile.write(data)
-                    # If remote command ends, reconnect
-                    if channel.exit_status_ready():
-                        raise Exception("Remote channel closed")
-                    time.sleep(0.05)
-        except Exception as e:
-            print(f"[stream_remote_log] Error: {e}. Reconnecting in 5s...")
-            # Close any stale resources before reconnecting
-            try:
-                if channel:
-                    channel.close()
-                if ssh:
-                    ssh.close()
-            except:
-                pass
-            time.sleep(5)
-            continue
+def fetch_drive_log():
+    """Download the log file from Google Drive and overwrite LOCAL_LOG."""
+    try:
+        r = requests.get(DRIVE_URL, stream=True)
+        if r.status_code == 200:
+            with open(LOCAL_LOG, "wb") as f:
+                for chunk in r.iter_content(1024):
+                    f.write(chunk)
+        else:
+            print(f"[fetch_drive_log] Error {r.status_code} fetching file")
+    except Exception as e:
+        print(f"[fetch_drive_log] Exception: {e}")
 
 def parse_line(line: str):
     parts = {}
@@ -78,45 +44,70 @@ def parse_line(line: str):
             parts[k.strip()] = v.strip()
     return parts
 
-def read_last_n(n: int):
+def get_new_records(last_seen_index: int):
+    """Return only new records since last_seen_index."""
+    fetch_drive_log()  # refresh file from Drive
+
     if not os.path.exists(LOCAL_LOG):
-        return []
+        return [], last_seen_index
+
     with open(LOCAL_LOG, "r") as f:
         lines = [ln for ln in f.readlines() if ln.strip()]
-    tail = lines[-n:] if len(lines) > n else lines
-    return [parse_line(ln) for ln in tail if parse_line(ln)]
 
-def tail_log():
-    """
-    Server-Sent Events: start at end-of-file, stream only NEW lines.
-    Prevents duplication of the 90-line history returned by /init.
-    """
-    if not os.path.exists(LOCAL_LOG):
-        # idle until local log appears
-        while True:
-            time.sleep(1)
-            yield f"data: {json.dumps({})}\n\n"
-    else:
-        with open(LOCAL_LOG, "r") as f:
-            f.seek(0, 2)  # jump to EOF, so we don't resend history
-            while True:
-                line = f.readline()
-                if not line:
-                    time.sleep(0.25)
-                    continue
-                parsed = parse_line(line)
-                if parsed:
-                    yield f"data: {json.dumps(parsed)}\n\n"
+    new_lines = lines[last_seen_index:]
+    new_index = len(lines)
+
+    records = [parse_line(ln) for ln in new_lines if parse_line(ln)]
+    return records, new_index
+
+def tail_log(start_index):
+    """SSE stream: yield only new records incrementally, starting from start_index."""
+    global last_line_index
+    last_line_index = start_index
+
+    while True:
+        new_records, new_index = get_new_records(last_line_index)
+        for rec in new_records:
+            yield f"id: {last_line_index}\ndata: {json.dumps(rec)}\n\n"
+            last_line_index += 1
+        time.sleep(2)  # poll every 2s
 
 @app.route("/stream")
 def stream():
-    return Response(tail_log(), mimetype="text/event-stream")
+    # Capture Last-Event-ID while request context is active
+    last_event_id = request.headers.get("Last-Event-ID")
+    try:
+        start_index = int(last_event_id) if last_event_id else last_line_index
+    except ValueError:
+        start_index = last_line_index
+
+    return Response(tail_log(start_index), mimetype="text/event-stream")
+
+@app.route("/new")
+def new_data():
+    global last_line_index
+    records, new_index = get_new_records(last_line_index)
+    last_line_index = new_index
+    return jsonify({"records": records})
 
 @app.route("/init")
 def init_data():
-    # Return a snapshot of last number_of_data_points rows
-    records = read_last_n(number_of_data_points)
+    """Return a snapshot of last N rows for initial load."""
+    fetch_drive_log()
+    if not os.path.exists(LOCAL_LOG):
+        return jsonify({"records": [], "fields": []})
+
+    with open(LOCAL_LOG, "r") as f:
+        lines = [ln for ln in f.readlines() if ln.strip()]
+
+    tail = lines[-number_of_data_points:] if len(lines) > number_of_data_points else lines
+    records = [parse_line(ln) for ln in tail if parse_line(ln)]
     fields = list(records[0].keys()) if records else ["Time","Status","Hash","Pwr","ITmp","OTmp","EElec","Incm"]
+
+    # Update last_line_index to end of file
+    global last_line_index
+    last_line_index = len(lines)
+
     return jsonify({"records": records, "fields": fields})
 
 @app.route("/")
@@ -124,26 +115,11 @@ def index():
     return render_template("index.html")
 
 def cleanup(sig=None, frame=None):
-    """Cleanly terminate remote tail and SSH on exit."""
-    global ssh, channel
-    print("Cleaning up SSH session...")
-    try:
-        if channel:
-            channel.close()
-        if ssh:
-            ssh.close()
-    except:
-        pass
+    print("Cleaning up...")
     sys.exit(0)
 
 if __name__ == "__main__":
-    # Handle Ctrl-C / kill cleanly
     signal.signal(signal.SIGINT, cleanup)
     signal.signal(signal.SIGTERM, cleanup)
 
-    # Start single background SSH tail (history + live)
-    t = threading.Thread(target=stream_remote_log, daemon=True)
-    t.start()
-
-    # IMPORTANT: Disable Flask reloader to avoid spawning multiple threads/processes
     app.run(host, port, threaded=True, debug=False, use_reloader=False)
