@@ -1,0 +1,1201 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Antminer Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        margin: 16px;
+        background: #121212;
+        color: #e0e0e0;
+      }
+      .controls {
+        flex: 1; /* let them share space evenly */
+        background: #1e1e1e;
+        padding: 10px 14px;
+        border-radius: 6px;
+        border: 1px solid #333;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+      }
+
+      .controls-wrapper {
+        display: flex;
+        justify-content: space-between; /* space them apart */
+        align-items: flex-start;
+        gap: 20px; /* spacing between the two blocks */
+        margin-bottom: 16px;
+        flex-wrap: wrap; /* allow stacking on small screens */
+      }
+
+      .chart-container {
+        width: 100%;
+        height: 280px;
+        margin-bottom: 20px;
+        background: #1e1e1e;
+        padding: 10px;
+        border-radius: 6px;
+      }
+      table {
+        border-collapse: collapse;
+        width: 100%;
+        margin-top: 20px;
+        background: #1e1e1e;
+        color: #e0e0e0;
+      }
+      th,
+      td {
+        border: 1px solid #333;
+        padding: 4px;
+        text-align: center;
+      }
+      th {
+        background: #2a2a2a;
+      }
+      .status-running {
+        background: #1b5e20;
+      }
+      .status-paused {
+        background: #b71c1c;
+      }
+      .spinner-overlay {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background: rgba(0, 0, 0, 0.7);
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        align-items: center;
+        z-index: 10;
+      }
+      .spinner {
+        border: 4px solid #ccc;
+        border-top: 4px solid #0078d4;
+        border-radius: 50%;
+        width: 30px;
+        height: 30px;
+        animation: spin 1s linear infinite;
+      }
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      .header-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 16px;
+        flex-wrap: nowrap; /* 👈 prevents wrapping */
+        gap: 20px;
+        white-space: nowrap; /* 👈 keeps summary text on one line */
+      }
+
+      .header-row h2 {
+        margin: 0;
+        font-size: 1.5rem;
+      }
+
+      #summaryStats {
+        font-size: 1rem;
+        font-weight: bold;
+        color: #fff;
+        background: #1e1e1e;
+        padding: 6px 12px;
+        border-radius: 6px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="header-row">
+      <h2>Antminer Dashboard</h2>
+      <div id="summaryStats">
+        Total Earned: <span id="earnedAmount">$0</span> &nbsp; | &nbsp; Total
+        Spent: <span id="spentAmount">$0</span>
+      </div>
+    </div>
+
+    <div class="controls-wrapper">
+      <div class="controls" id="rowControl">
+        <label for="maxPointsInput">Max points per chart:</label>
+        <input
+          type="number"
+          id="maxPointsInput"
+          value="90"
+          min="50"
+          max="2000"
+          step="30"
+        />
+        <button id="applyMaxPoints">Apply</button>
+      </div>
+
+      <div class="controls" id="ratioControls">
+        <label>
+          Numerator:
+          <select id="numerator"></select>
+        </label>
+        <label>
+          Denominator:
+          <select id="denominator"></select>
+        </label>
+        <button id="addRatioBtn">Add Ratio Chart</button>
+      </div>
+    </div>
+
+    <!-- Ratio Charts -->
+    <div id="ratioCharts"></div>
+
+    <!-- Merged chart -->
+    <div class="chart-container">
+      <canvas id="mergedChart"></canvas>
+    </div>
+    <div class="chart-container">
+      <canvas id="tempChart"></canvas>
+    </div>
+
+    <!-- Individual chart toggles -->
+    <div class="controls" id="controls"></div>
+
+    <!-- Individual charts -->
+    <div id="charts"></div>
+
+    <!-- Log Table -->
+    <table id="logTable">
+      <thead>
+        <tr id="headerRow"></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+
+    <script>
+      // Globals
+      let MAX_POINTS = 90;
+      let fullHistory = []; // keep every row we’ve ever seen
+
+      let allColumns = [];
+      let records = [];
+      const charts = {}; // individual charts keyed by column
+      const ratioCharts = {}; // keyed by "numer/denom" -> { chart, numer, denom }
+      const statusArray = []; // parallel array for shading
+      let mergedChart = null; // single merged chart instance
+      let tempChart = null;
+
+      const numSel = document.getElementById("numerator");
+      const denSel = document.getElementById("denominator");
+      const addRatioBtn = document.getElementById("addRatioBtn");
+
+      // De-dupe + stream guard
+      let seenRows = new Set();
+      function rowKey(d) {
+        return d && d.Time
+          ? d.Time + "|" + JSON.stringify(d)
+          : JSON.stringify(d);
+      }
+      let evt = null;
+
+      // Field rules
+      const ratioRules = {
+        Hash: { min: 1 },
+        Pwr: { min: 100, max: 5000 },
+      };
+      const fieldRanges = {
+        Hash: { min: 140, max: 350 }, // TH/s
+        Pwr: { min: 75, max: 4500 }, // Watts
+        Pincm: { min: -50, max: 1000 },
+      };
+
+      // Plugin: shade chart background based on miner status
+      const statusShadingPlugin = {
+        id: "statusShading",
+        beforeDraw(chart, args, opts) {
+          if (!opts || !opts.statusArray) return;
+          const ctx = chart.ctx;
+          const xAxis = chart.scales.x;
+          // find any Y‑axis (works for y, yHash, yAmTmp, yITmp, etc.)
+          const yAxes = Object.values(chart.scales).filter(
+            (s) => s.axis === "y"
+          );
+          if (!xAxis || !yAxes.length) return;
+          const yAxis = yAxes[0]; // use the first Y axis for vertical span
+
+          chart.data.labels.forEach((_, i) => {
+            const status = opts.statusArray[i];
+            if (!status) return;
+            const xStart = xAxis.getPixelForValue(i - 0.5);
+            const xEnd = xAxis.getPixelForValue(i + 0.5);
+            ctx.save();
+            ctx.fillStyle =
+              status === "Running"
+                ? "rgba(27,94,32,0.15)"
+                : "rgba(183,28,28,0.15)";
+            ctx.fillRect(
+              xStart,
+              yAxis.top,
+              xEnd - xStart,
+              yAxis.bottom - yAxis.top
+            );
+            ctx.restore();
+          });
+        },
+      };
+      Chart.register(statusShadingPlugin);
+
+      // Helpers
+      function clampValue(field, val) {
+        const rule = fieldRanges[field];
+        if (!rule) return val;
+        if (val < rule.min) return rule.min;
+        if (val > rule.max) return rule.max;
+        return val;
+      }
+
+      function updateSummaryStats(dataRows) {
+        let totalEarned = 0;
+        let totalSpent = 0;
+
+        dataRows.forEach((row) => {
+          const incmRaw = (row.Incm ?? "").toString();
+          const expnRaw = (row.Expn ?? "").toString();
+
+          const incm = parseFloat(incmRaw.replace(/[^\d.\-]/g, ""));
+          const expn = parseFloat(expnRaw.replace(/[^\d.\-]/g, ""));
+
+          if (!isNaN(incm)) totalEarned += incm;
+          if (!isNaN(expn)) totalSpent += expn;
+        });
+
+        document.getElementById(
+          "earnedAmount"
+        ).textContent = `$${totalEarned.toFixed(5)}`;
+        document.getElementById(
+          "spentAmount"
+        ).textContent = `$${totalSpent.toFixed(5)}`;
+      }
+
+      function formatTimestamp(ts) {
+        if (!ts) return ts;
+        const main = ts.split(/[+-]\d{4}$/)[0];
+        const [date, time] = main.split("T");
+
+        if (!date || !time) return ts;
+        const compactDate = date.replace(/-/g, "");
+        const timePart = time.slice(0, 5); // "HH:mm"
+        return compactDate + "-" + timePart;
+      }
+
+      // Chart creators
+      function createChart(ctx, label, color) {
+        return new Chart(ctx, {
+          type: "line",
+          data: {
+            labels: [],
+            datasets: [
+              {
+                label,
+                data: [],
+                borderColor: color,
+                borderWidth: 3,
+                backgroundColor: "transparent",
+                fill: false,
+                tension: 0.3,
+                pointRadius: 4,
+                pointBackgroundColor: color,
+                pointBorderColor: "#000",
+              },
+            ],
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+              x: { ticks: { color: "#ddd" }, grid: { color: "#444" } },
+              y: {
+                ticks: { color: "#ddd" },
+                grid: { color: "#444" },
+                beginAtZero: false,
+              },
+            },
+            plugins: {
+              legend: { labels: { color: "#fff" } },
+              statusShading: { statusArray },
+            },
+          },
+        });
+      }
+
+      function createRatioChart(ctx, label) {
+        return new Chart(ctx, {
+          type: "line",
+          data: {
+            labels: [],
+            datasets: [
+              {
+                label,
+                data: [],
+                borderColor: "#fff",
+                borderWidth: 2,
+                backgroundColor: "transparent",
+                fill: false,
+                tension: 0.3,
+                pointRadius: 3,
+                pointBackgroundColor: "#fff",
+                pointBorderColor: "#000",
+              },
+            ],
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+              x: { ticks: { color: "#ddd" }, grid: { color: "#444" } },
+              y: {
+                ticks: { color: "#ddd" },
+                grid: { color: "#444" },
+                beginAtZero: false,
+              },
+            },
+            plugins: {
+              legend: { labels: { color: "#fff" } },
+              statusShading: { statusArray },
+            },
+          },
+        });
+      }
+
+      function createMergedChart(ctx) {
+        return new Chart(ctx, {
+          type: "line",
+          data: {
+            labels: [],
+            datasets: [
+              {
+                label: "Hash (TH/s)",
+                data: [],
+                borderColor: "#4caf50",
+                backgroundColor: "transparent",
+                fill: false,
+                tension: 0.3,
+                yAxisID: "yHash",
+                pointRadius: 3,
+                pointBackgroundColor: "#4caf50",
+                pointBorderColor: "#000",
+              },
+              {
+                label: "Power (W)",
+                data: [],
+                borderColor: "#f44336",
+                backgroundColor: "transparent",
+                fill: false,
+                tension: 0.3,
+                yAxisID: "yPwr",
+                pointRadius: 3,
+                pointBackgroundColor: "#f44336",
+                pointBorderColor: "#000",
+              },
+              {
+                label: "AElec (¢/kWh)",
+                data: [],
+                borderColor: "#2196f3",
+                backgroundColor: "transparent",
+                fill: false,
+                tension: 0.3,
+                yAxisID: "yAElec",
+                pointRadius: 3,
+                pointBackgroundColor: "#2196f3",
+                pointBorderColor: "#000",
+              },
+              {
+                label: "Efficiency (W per TH/s)",
+                data: [],
+                borderColor: "#ffeb3b",
+                backgroundColor: "transparent",
+                fill: false,
+                tension: 0.3,
+                yAxisID: "yEff",
+                pointRadius: 3,
+                pointBackgroundColor: "#ffeb3b",
+                pointBorderColor: "#000",
+              },
+            ],
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+              x: { ticks: { color: "#ddd" }, grid: { color: "#444" } },
+              yHash: {
+                type: "linear",
+                position: "left",
+                ticks: { color: "#4caf50" },
+                grid: { drawOnChartArea: false },
+              },
+              yPwr: {
+                type: "linear",
+                position: "right",
+                ticks: { color: "#f44336" },
+                grid: { drawOnChartArea: false },
+              },
+              yAElec: {
+                type: "linear",
+                position: "right",
+                offset: true,
+                ticks: { color: "#2196f3" },
+                grid: { drawOnChartArea: false },
+              },
+              yEff: {
+                type: "linear",
+                position: "left",
+                offset: true,
+                min: 0, // start at zero
+                ticks: { color: "#ffeb3b" },
+                grid: { drawOnChartArea: false },
+              },
+            },
+            plugins: {
+              legend: { labels: { color: "#fff" } },
+              statusShading: { statusArray },
+            },
+          },
+        });
+      }
+
+      function createTempChart(ctx) {
+        return new Chart(ctx, {
+          type: "line",
+          data: {
+            labels: [],
+            datasets: [
+              {
+                label: "AmTmp (°C)",
+                data: [],
+                borderColor: "#ff9800",
+                backgroundColor: "transparent",
+                fill: false,
+                tension: 0.3,
+                yAxisID: "yAmTmp",
+                pointRadius: 3,
+                pointBackgroundColor: "#ff9800",
+                pointBorderColor: "#000",
+              },
+              {
+                label: "ITmp (°C)",
+                data: [],
+                borderColor: "#9c27b0",
+                backgroundColor: "transparent",
+                fill: false,
+                tension: 0.3,
+                yAxisID: "yITmp",
+                pointRadius: 3,
+                pointBackgroundColor: "#9c27b0",
+                pointBorderColor: "#000",
+              },
+            ],
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+              x: { ticks: { color: "#ddd" }, grid: { color: "#444" } },
+              yAmTmp: {
+                type: "linear",
+                position: "left",
+                ticks: { color: "#ff9800" },
+                grid: { drawOnChartArea: false },
+              },
+              yITmp: {
+                type: "linear",
+                position: "right",
+                ticks: { color: "#9c27b0" },
+                grid: { drawOnChartArea: false },
+              },
+            },
+            plugins: {
+              legend: { labels: { color: "#fff" } },
+              statusShading: { statusArray },
+            },
+          },
+        });
+      }
+
+      function updateTempChart(data) {
+        if (!tempChart) return;
+
+        const ts = data.Time
+          ? formatTimestamp(data.Time)
+          : new Date().toLocaleTimeString();
+        tempChart.data.labels.push(ts);
+
+        const am = parseFloat(
+          ((data.AmTmp || "") + "").replace(/[^0-9.\-]/g, "")
+        );
+        const it = parseFloat(
+          ((data.ITmp || "") + "").replace(/[^0-9.\-]/g, "")
+        );
+
+        tempChart.data.datasets[0].data.push(!isNaN(am) ? am : null);
+        tempChart.data.datasets[1].data.push(!isNaN(it) ? it : null);
+
+        if (tempChart.data.labels.length > MAX_POINTS) {
+          tempChart.data.labels.shift();
+          tempChart.data.datasets.forEach((ds) => ds.data.shift());
+        }
+
+        tempChart.update();
+      }
+
+      // Table
+      function renderTable(subset) {
+        const tbody = document.querySelector("#logTable tbody");
+        tbody.innerHTML = ""; // Clear all rows
+
+        const reversed = subset.slice().reverse(); // Newest at top
+
+        for (const data of reversed) {
+          const status = data["Status"] || "";
+          const cls =
+            status === "Running"
+              ? "status-running"
+              : status === "Paused"
+              ? "status-paused"
+              : "";
+
+          let row = "<tr class='" + cls + "'>";
+          for (const col of allColumns) {
+            let val = data[col] ?? "";
+            if (col === "Time") val = formatTimestamp(val);
+            row += "<td>" + val + "</td>";
+          }
+          row += "</tr>";
+          tbody.insertAdjacentHTML("beforeend", row);
+        }
+      }
+
+      // Autoscale
+      function autoscaleY(chart, values) {
+        if (!values.length) return;
+        const min = Math.min(...values);
+        const max = Math.max(...values);
+        if (min === max) {
+          chart.options.scales.y.min = min * 0.9;
+          chart.options.scales.y.max = max * 1.1 + 0.1;
+        } else {
+          chart.options.scales.y.min = min * 0.9;
+          chart.options.scales.y.max = max * 1.1;
+        }
+      }
+
+      function updateCharts(data) {
+        const ts = data.Time
+          ? formatTimestamp(data.Time)
+          : new Date().toLocaleTimeString();
+
+        allColumns.forEach((col) => {
+          if (col === "Time" || col === "Status") return;
+
+          const raw = (data[col] ?? "").toString();
+          const num = parseFloat(raw.replace(/[^0-9.\-]/g, ""));
+          if (!isNaN(num) && charts[col]) {
+            const chart = charts[col];
+            const val = clampValue(col, num);
+
+            chart.data.labels.push(ts);
+            chart.data.datasets[0].data.push(val);
+
+            // enforce sliding window
+            if (chart.data.labels.length > MAX_POINTS) {
+              chart.data.labels.shift();
+              chart.data.datasets.forEach((ds) => ds.data.shift());
+            }
+
+            const values = chart.data.datasets[0].data.filter(
+              (v) => v !== undefined && v !== null
+            );
+            autoscaleY(chart, values);
+            chart.update();
+          }
+        });
+      }
+
+      // Merged chart update
+      function updateMergedChart(data) {
+        if (!mergedChart) return;
+
+        const ts = data.Time
+          ? formatTimestamp(data.Time)
+          : new Date().toLocaleTimeString();
+        mergedChart.data.labels.push(ts);
+
+        const h = parseFloat(
+          ((data.Hash || "") + "").replace(/[^0-9.\-]/g, "")
+        );
+        const p = parseFloat(((data.Pwr || "") + "").replace(/[^0-9.\-]/g, ""));
+        const a = parseFloat(
+          ((data.AElec || "") + "").replace(/[^0-9.\-]/g, "")
+        );
+
+        mergedChart.data.datasets[0].data.push(!isNaN(h) ? h : null);
+        mergedChart.data.datasets[1].data.push(!isNaN(p) ? p : null);
+        mergedChart.data.datasets[2].data.push(!isNaN(a) ? a : null);
+
+        // Efficiency = Hash ÷ Power
+        let eff = 0; // default baseline
+        if (!isNaN(h) && !isNaN(p) && p > 0) {
+          eff = p / h;
+        }
+        mergedChart.data.datasets[3].data.push(eff);
+
+        if (mergedChart.data.labels.length > MAX_POINTS) {
+          mergedChart.data.labels.shift();
+          mergedChart.data.datasets.forEach((ds) => ds.data.shift());
+        }
+
+        mergedChart.update();
+      }
+
+      // Toggles + selection
+      function toggleChart(col, show) {
+        const div = document.getElementById("chart-" + col);
+        if (div) div.style.display = show ? "block" : "none";
+      }
+      function saveSelection() {
+        const state = {};
+        document.querySelectorAll(".chart-toggle").forEach((cb) => {
+          state[cb.getAttribute("data-col")] = cb.checked;
+        });
+        localStorage.setItem("chartSelection", JSON.stringify(state));
+        localStorage.setItem(
+          "masterToggle",
+          document.getElementById("toggleAll").checked
+        );
+      }
+      function loadSelection() {
+        const state = JSON.parse(
+          localStorage.getItem("chartSelection") || "{}"
+        );
+        const master = localStorage.getItem("masterToggle");
+        return { state, master };
+      }
+
+      // Ratio charts
+      function addRatioChart(numer, denom) {
+        const key = numer + "/" + denom;
+        if (ratioCharts[key]) return;
+
+        const div = document.createElement("div");
+        div.className = "chart-container";
+        div.id = "chart-" + key;
+
+        const safeId = key.replace(/\W+/g, "_");
+        div.innerHTML = `
+              <div style="display:flex;justify-content:space-between;align-items:center;">
+                <span style="font-weight:bold">${key}</span>
+                <button onclick="removeRatioChart('${key}')">Remove</button>
+              </div>
+              <canvas id="${safeId}Chart"></canvas>
+            `;
+        document.getElementById("ratioCharts").appendChild(div);
+
+        // 🔧 Auto-scale the chart container and canvas
+        div.style.width = "100%";
+        div.style.height = "min(40vh, 400px)"; // scales with screen but stays bounded
+        const canvas = div.querySelector("canvas");
+        canvas.style.width = "100%";
+        canvas.style.height = "100%";
+        canvas.style.display = "block"; // avoids inline shrink
+
+        const ctx = document.getElementById(safeId + "Chart").getContext("2d");
+        const chart = createRatioChart(ctx, key);
+        ratioCharts[key] = { chart, numer, denom, seen: new Set() };
+
+        records.forEach((r) => updateRatioData(r, numer, denom));
+        saveRatioCharts();
+      }
+      function removeRatioChart(key) {
+        const rc = ratioCharts[key];
+        if (!rc) return;
+        rc.chart.destroy();
+        delete ratioCharts[key];
+        const div = document.getElementById("chart-" + key);
+        if (div) div.remove();
+        saveRatioCharts();
+      }
+      function saveRatioCharts() {
+        const active = Object.keys(ratioCharts);
+        localStorage.setItem("activeRatioCharts", JSON.stringify(active));
+      }
+
+      function updateRatioData(data, numer, denom) {
+        const key = `${numer}/${denom}`;
+        const rc = ratioCharts[key];
+        if (!rc) return;
+
+        const ts = data.Time
+          ? formatTimestamp(data.Time)
+          : new Date().toLocaleTimeString();
+
+        if (rc.seen.has(ts)) return; // prevent duplicate timestamps
+        rc.seen.add(ts);
+
+        const n = parseFloat(
+          ((data[numer] || "") + "").replace(/[^0-9.\-]/g, "")
+        );
+        const d = parseFloat(
+          ((data[denom] || "") + "").replace(/[^0-9.\-]/g, "")
+        );
+
+        let val = null;
+        if (!isNaN(n) && !isNaN(d) && d !== 0) {
+          const nr = ratioRules[numer] || {};
+          const dr = ratioRules[denom] || {};
+          const nOk =
+            (nr.min === undefined || n >= nr.min) &&
+            (nr.max === undefined || n <= nr.max);
+          const dOk =
+            (dr.min === undefined || d >= dr.min) &&
+            (dr.max === undefined || d <= dr.max);
+          if (nOk && dOk) val = n / d;
+        }
+
+        rc.chart.data.labels.push(ts);
+        rc.chart.data.datasets[0].data.push(val);
+
+        // enforce sliding window
+        if (rc.chart.data.labels.length > MAX_POINTS) {
+          rc.chart.data.labels.shift();
+          rc.chart.data.datasets.forEach((ds) => ds.data.shift());
+        }
+
+        const values = rc.chart.data.datasets[0].data.filter(
+          (v) => v !== null && v !== undefined
+        );
+        autoscaleY(rc.chart, values);
+        rc.chart.update();
+      }
+
+      // Wire ratio button
+      addRatioBtn.addEventListener("click", () => {
+        const numer = numSel.value;
+        const denom = denSel.value;
+        if (
+          !numer ||
+          !denom ||
+          numer === "Time" ||
+          numer === "Status" ||
+          denom === "Time" ||
+          denom === "Status"
+        )
+          return;
+        addRatioChart(numer, denom);
+      });
+
+      // Init
+      fetch("/init")
+        .then((r) => r.json())
+        .then((payload) => {
+          // reset
+          document.querySelector("#logTable tbody").innerHTML = "";
+          records = [];
+          seenRows.clear();
+
+          records = payload.records || [];
+          allColumns = payload.fields || [];
+
+          // header
+          const header = document.getElementById("headerRow");
+          header.innerHTML = "";
+          allColumns.forEach((c) => (header.innerHTML += "<th>" + c + "</th>"));
+
+          // ratio dropdowns
+          numSel.innerHTML = "";
+          denSel.innerHTML = "";
+          allColumns.forEach((c) => {
+            if (c === "Time" || c === "Status") return;
+            numSel.add(new Option(c, c));
+            denSel.add(new Option(c, c));
+          });
+
+          // restore saved ratio charts
+          const savedRatios = JSON.parse(
+            localStorage.getItem("activeRatioCharts") || "[]"
+          );
+          savedRatios.forEach((key) => {
+            const [numer, denom] = key.split("/");
+            if (allColumns.includes(numer) && allColumns.includes(denom)) {
+              addRatioChart(numer, denom);
+            }
+          });
+          if (allColumns.includes("Pwr")) numSel.value = "Pwr";
+          if (allColumns.includes("Hash")) denSel.value = "Hash";
+
+          // toggles
+          const controls = document.getElementById("controls");
+          controls.innerHTML =
+            '<label><input type="checkbox" id="toggleAll" checked> <b>Select/Deselect All</b></label>';
+
+          // load saved chart visibility state once
+          const { state: savedState, master: savedMaster } = loadSelection();
+
+          // individual chart checkboxes (but don’t create charts yet)
+          const chartsDiv = document.getElementById("charts");
+          chartsDiv.innerHTML = "";
+          allColumns.forEach((col) => {
+            if (col === "Time" || col === "Status") return;
+
+            controls.innerHTML +=
+              ' <label><input type="checkbox" class="chart-toggle" data-col="' +
+              col +
+              '"' +
+              (savedState[col] !== false ? " checked" : "") +
+              "> " +
+              col +
+              "</label>";
+
+            // only create chart if user had it visible last time
+            if (savedState[col] !== false) {
+              createAndAttachChart(col, chartsDiv);
+            }
+          });
+
+          // initialize merged chart once
+          const mergedCtx = document
+            .getElementById("mergedChart")
+            .getContext("2d");
+          mergedChart = createMergedChart(mergedCtx);
+
+          // Initialize temperature chart
+          const tempCtx = document.getElementById("tempChart").getContext("2d");
+          tempChart = createTempChart(tempCtx);
+
+          // restore master toggle
+          if (savedMaster !== null) {
+            document.getElementById("toggleAll").checked =
+              savedMaster === "true";
+          }
+
+          // master toggle
+          document
+            .getElementById("toggleAll")
+            .addEventListener("change", function () {
+              const checked = this.checked;
+              document.querySelectorAll(".chart-toggle").forEach((cb) => {
+                cb.checked = checked;
+                toggleChartLazy(
+                  cb.getAttribute("data-col"),
+                  checked,
+                  chartsDiv
+                );
+              });
+              saveSelection();
+            });
+
+          // individual toggles (lazy create/destroy)
+          document.querySelectorAll(".chart-toggle").forEach((cb) => {
+            cb.addEventListener("change", function () {
+              toggleChartLazy(
+                this.getAttribute("data-col"),
+                this.checked,
+                chartsDiv
+              );
+              const all = document.querySelectorAll(".chart-toggle");
+              const allChecked = Array.from(all).every((x) => x.checked);
+              document.getElementById("toggleAll").checked = allChecked;
+              saveSelection();
+            });
+          });
+
+          // preload existing records into any created charts
+          records.forEach((r) => {
+            const key = rowKey(r);
+            if (seenRows.has(key)) return;
+            seenRows.add(key);
+
+            //addRow(r);
+            updateCharts(r);
+            fullHistory.push(r);
+
+            statusArray.push(r.Status);
+            if (statusArray.length > MAX_POINTS) statusArray.shift();
+
+            updateMergedChart(r);
+            updateTempChart(r);
+
+            Object.values(ratioCharts).forEach((rc) => {
+              updateRatioData(r, rc.numer, rc.denom);
+            });
+            const subset = fullHistory.slice(-MAX_POINTS);
+            renderTable(subset);
+            updateSummaryStats(subset);
+          });
+
+          document
+            .getElementById("applyMaxPoints")
+            .addEventListener("click", () => {
+              const val = parseInt(
+                document.getElementById("maxPointsInput").value,
+                10
+              );
+              if (!isNaN(val) && val > 0) {
+                MAX_POINTS = val;
+                rebuildAllCharts();
+              }
+            });
+
+          // stream
+          if (evt) {
+            try {
+              evt.close();
+            } catch (_) {}
+          }
+          evt = new EventSource("/stream");
+          evt.onmessage = (e) => {
+            const d = JSON.parse(e.data || "{}");
+            if (!Object.keys(d).length) return;
+            const key = rowKey(d);
+            if (seenRows.has(key)) return;
+            seenRows.add(key);
+
+            updateCharts(d);
+            fullHistory.push(d); // Push first
+
+            updateMergedChart(d);
+            updateTempChart(d);
+
+            Object.values(ratioCharts).forEach((rc) => {
+              updateRatioData(d, rc.numer, rc.denom);
+            });
+
+            Object.values(charts).forEach((c) => c.update());
+            Object.values(ratioCharts).forEach((rc) => rc.chart.update());
+
+            // ✅ Now render the table with the latest slice
+            const subset = fullHistory.slice(-MAX_POINTS);
+            renderTable(subset);
+            updateSummaryStats(subset);
+          };
+
+          evt.onerror = (_) => {
+            try {
+              evt.close();
+            } catch (_) {}
+            setTimeout(() => {
+              evt = new EventSource("/stream");
+            }, 1500);
+          };
+        });
+
+      // helper: create chart lazily
+      function createAndAttachChart(col, chartsDiv) {
+        const div = document.createElement("div");
+        div.className = "chart-container";
+        div.id = "chart-" + col;
+        div.innerHTML = "<canvas id='" + col + "Chart'></canvas>";
+        chartsDiv.appendChild(div);
+
+        const ctx = document.getElementById(col + "Chart").getContext("2d");
+
+        // Always call your factory
+        const color =
+          "#" +
+          Math.floor(Math.random() * 17777215)
+            .toString(16)
+            .padStart(6, "0");
+
+        charts[col] = createChart(ctx, col, color);
+
+        // backfill with existing records
+        records.forEach((r) => updateCharts(r));
+      }
+
+      // helper: toggle chart lazily
+      function toggleChartLazy(col, checked, chartsDiv) {
+        if (checked && !charts[col]) {
+          createAndAttachChart(col, chartsDiv);
+        } else if (!checked && charts[col]) {
+          charts[col].destroy();
+          delete charts[col];
+          document.getElementById("chart-" + col).remove();
+        }
+      }
+
+      async function rebuildAllCharts(maxPoints = MAX_POINTS) {
+        if (fullHistory.length && maxPoints > fullHistory.length) {
+          maxPoints = fullHistory.length;
+        }
+
+        const subset = fullHistory.slice(-MAX_POINTS);
+        renderTable(subset);
+        updateSummaryStats(subset);
+
+        // helper: wait for next frame or small delay
+        const wait = (ms = 0) =>
+          new Promise((resolve) => setTimeout(resolve, ms));
+
+        // ratio charts
+        for (const [key, rc] of Object.entries(ratioCharts)) {
+          rc.chart.data.labels = [];
+          rc.chart.data.datasets.forEach((ds) => (ds.data = []));
+
+          subset.forEach((row) => {
+            const [numer, denom] = key.split("/");
+            const n = parseFloat(
+              ((row[numer] || "") + "").replace(/[^0-9.\-]/g, "")
+            );
+            const d = parseFloat(
+              ((row[denom] || "") + "").replace(/[^0-9.\-]/g, "")
+            );
+            let val = null;
+            if (!isNaN(n) && !isNaN(d) && d !== 0) val = n / d;
+
+            const ts = row.Time
+              ? formatTimestamp(row.Time)
+              : new Date().toLocaleTimeString();
+
+            rc.chart.data.labels.push(ts);
+            rc.chart.data.datasets[0].data.push(val);
+          });
+
+          autoscaleY(
+            rc.chart,
+            rc.chart.data.datasets[0].data.filter((v) => v != null)
+          );
+
+          if (rc.chart && rc.chart.options && rc.chart.options.plugins) {
+            rc.chart.options.plugins.statusShading = {
+              statusArray: buildStatusArray(rc.chart.data.labels),
+            };
+          }
+
+          rc.chart.update();
+          await wait(50);
+        }
+        // merged chart
+        if (mergedChart) {
+          mergedChart.data.labels = [];
+          mergedChart.data.datasets.forEach((ds) => {
+            ds.data = [];
+          });
+
+          subset.forEach((row) => {
+            const ts = row.Time
+              ? formatTimestamp(row.Time)
+              : new Date().toLocaleTimeString();
+            mergedChart.data.labels.push(ts);
+
+            mergedChart.options.plugins.statusShading = {
+              statusArray: buildStatusArray(mergedChart.data.labels),
+            };
+
+            const hash = parseFloat(
+              ((row.Hash ?? "") + "").replace(/[^0-9.\-]/g, "")
+            );
+            const pwr = parseFloat(
+              ((row.Pwr ?? "") + "").replace(/[^0-9.\-]/g, "")
+            );
+            const aelec = parseFloat(
+              ((row.AElec ?? "") + "").replace(/[^0-9.\-]/g, "")
+            );
+
+            mergedChart.data.datasets[0].data.push(!isNaN(hash) ? hash : null);
+            mergedChart.data.datasets[1].data.push(!isNaN(pwr) ? pwr : null);
+            mergedChart.data.datasets[2].data.push(
+              !isNaN(aelec) ? aelec : null
+            );
+          });
+
+          if (
+            mergedChart &&
+            mergedChart.options &&
+            mergedChart.options.plugins
+          ) {
+            mergedChart.options.plugins.statusShading = {
+              statusArray: buildStatusArray(mergedChart.data.labels),
+            };
+          }
+
+          mergedChart.update();
+          await wait(50);
+        }
+
+        // temperature chart (AmTmp + ITmp)
+        if (tempChart) {
+          tempChart.data.labels = [];
+          tempChart.data.datasets.forEach((ds) => {
+            ds.data = [];
+          });
+
+          subset.forEach((row) => {
+            const ts = row.Time
+              ? formatTimestamp(row.Time)
+              : new Date().toLocaleTimeString();
+            tempChart.data.labels.push(ts);
+
+            // Assuming dataset order: [AmTmp, ITmp]
+            const amTmp = parseFloat(
+              ((row.AmTmp ?? "") + "").replace(/[^0-9.\-]/g, "")
+            );
+            const iTmp = parseFloat(
+              ((row.ITmp ?? "") + "").replace(/[^0-9.\-]/g, "")
+            );
+
+            tempChart.data.datasets[0].data.push(!isNaN(amTmp) ? amTmp : null);
+            tempChart.data.datasets[1].data.push(!isNaN(iTmp) ? iTmp : null);
+          });
+
+          if (tempChart && tempChart.options && tempChart.options.plugins) {
+            tempChart.options.plugins.statusShading = {
+              statusArray: buildStatusArray(tempChart.data.labels),
+            };
+          }
+
+          tempChart.update();
+          await wait(50);
+        }
+
+        // individual charts
+        for (const col of allColumns) {
+          if (col === "Time" || col === "Status") continue;
+          const chart = charts[col];
+          if (!chart) continue;
+
+          chart.data.labels = [];
+          chart.data.datasets.forEach((ds) => (ds.data = []));
+
+          subset.forEach((row) => {
+            const ts = row.Time
+              ? formatTimestamp(row.Time)
+              : new Date().toLocaleTimeString();
+            const raw = (row[col] ?? "").toString();
+            const num = parseFloat(raw.replace(/[^0-9.\-]/g, ""));
+            if (!isNaN(num)) {
+              chart.data.labels.push(ts);
+              chart.data.datasets[0].data.push(clampValue(col, num));
+            }
+          });
+
+          autoscaleY(chart, chart.data.datasets[0].data);
+
+          if (chart?.options?.plugins) {
+            chart.options.plugins.statusShading = {
+              statusArray: buildStatusArray(chart.data.labels),
+            };
+          }
+
+          chart.update();
+          await wait(50); // let it render before moving on
+        }
+      }
+      function buildStatusArray(labels) {
+        return labels.map((label) => {
+          const entry = records.find((r) => formatTimestamp(r.Time) === label);
+          return entry?.Status === "Running" ? "Running" : "Paused";
+        });
+      }
+    </script>
+  </body>
+</html>
